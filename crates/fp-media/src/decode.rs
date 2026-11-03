@@ -7,6 +7,7 @@ use fp_ffmpeg_sys as ff;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 pub(crate) static HW_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -286,11 +287,25 @@ impl Drop for Native {
     }
 }
 
+/// How long a decoder not told of end of stream has to hand over its next
+/// picture before it counts as drained, and its first since a flush, which
+/// also has a session to start.
+const LAST_PICTURE_WAIT: Duration = Duration::from_millis(300);
+const FIRST_PICTURE_WAIT: Duration = Duration::from_secs(3);
+
 pub struct Decoder {
     /// FFmpeg decoder; null while the native decoder is active.
     ctx: *mut ff::AVCodecContext,
     #[cfg(target_os = "linux")]
     native: Option<Box<Native>>,
+    /// FFmpeg's V4L2 wrapper can't decode again after end of stream: it has
+    /// no flush, and a read then waits forever. So it isn't told of one when
+    /// it needn't be: VP8 and VP9 pictures come out in the order they go in.
+    no_end_of_stream: bool,
+    /// End of stream was held back: `receive` waits for what's still coming.
+    ending: bool,
+    /// No picture since opening or a flush.
+    first_picture: bool,
     /// Packets to feed the FFmpeg decoder before new ones (after a fallback).
     replay: std::collections::VecDeque<Packet>,
     /// End of stream goes in after `replay`, from `receive`: the fallback
@@ -421,6 +436,9 @@ impl Decoder {
             native: None,
             replay: Default::default(),
             replay_end: false,
+            no_end_of_stream: false,
+            ending: false,
+            first_picture: true,
             name: String::new(),
             hardware: false,
             hardware_error: None,
@@ -470,6 +488,9 @@ impl Decoder {
             native: None,
             replay: Default::default(),
             replay_end: false,
+            no_end_of_stream: false,
+            ending: false,
+            first_picture: true,
             name: String::new(),
             hardware: false,
             hardware_error: None,
@@ -587,6 +608,9 @@ impl Decoder {
             })),
             replay: Default::default(),
             replay_end: false,
+            no_end_of_stream: false,
+            ending: false,
+            first_picture: true,
             name,
             hardware: true,
             hardware_error: None,
@@ -629,6 +653,9 @@ impl Decoder {
                 native: None,
                 replay: Default::default(),
                 replay_end: false,
+                no_end_of_stream: false,
+                ending: false,
+                first_picture: true,
                 name,
                 hardware,
                 hardware_error: None,
@@ -687,6 +714,8 @@ impl Decoder {
                 },
             )?;
             dec.time_base = time_base;
+            dec.no_end_of_stream =
+                hardware && matches!((*par).codec_id, ff::AV_CODEC_ID_VP8 | ff::AV_CODEC_ID_VP9);
             Ok(dec)
         }
     }
@@ -797,6 +826,10 @@ impl Decoder {
         if self.ctx.is_null() {
             return Err(Error::Unsupported("decoder closed after a failure".into()));
         }
+        if pkt.is_null() && self.no_end_of_stream {
+            self.ending = true;
+            return Ok(true);
+        }
         // SAFETY: ctx is open; pkt valid or null.
         let r = unsafe { ff::avcodec_send_packet(self.ctx, pkt) };
         if r == ff::AVERROR_EAGAIN || r == ff::AVERROR_EOF_ {
@@ -848,6 +881,7 @@ impl Decoder {
         if self.ctx.is_null() {
             return Err(Error::Unsupported("decoder closed after a failure".into()));
         }
+        let mut waiting_since = Instant::now();
         loop {
             // SAFETY: ctx is open; frame valid.
             let r = unsafe { ff::avcodec_receive_frame(self.ctx, frame.0) };
@@ -858,12 +892,25 @@ impl Decoder {
                     }
                     continue;
                 }
+                if self.ending {
+                    let wait = if self.first_picture {
+                        FIRST_PICTURE_WAIT
+                    } else {
+                        LAST_PICTURE_WAIT
+                    };
+                    if waiting_since.elapsed() >= wait {
+                        return Ok(Some(false));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 return Ok(None);
             }
             if r == ff::AVERROR_EOF_ {
                 return Ok(Some(false));
             }
             check(r, "receive frame")?;
+            waiting_since = Instant::now();
             if let Some(s) = self.skip {
                 // SAFETY: a decoded frame, our reference to it dropped when
                 // it is left out.
@@ -879,6 +926,7 @@ impl Decoder {
             if self.hardware {
                 copy_out(frame)?;
             }
+            self.first_picture = false;
             return Ok(Some(true));
         }
     }
@@ -959,6 +1007,8 @@ impl Decoder {
         }
         self.replay.clear();
         self.replay_end = false;
+        self.ending = false;
+        self.first_picture = true;
         if !self.ctx.is_null() {
             // SAFETY: ctx is open.
             unsafe { ff::avcodec_flush_buffers(self.ctx) };
@@ -1037,6 +1087,66 @@ mod tests {
             }
         }
         (dec.name.clone(), out)
+    }
+
+    #[test]
+    fn a_stream_finishes_and_restarts_without_telling_the_decoder_it_ended() {
+        // CI has no V4L2 device: one-thread software decoding hands pictures
+        // over as soon as they go in, as the wrapper does.
+        fn open() -> (Input, Decoder, usize) {
+            let name = "vp9.webm";
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data")
+                .join(name);
+            let input = Input::open(
+                Arc::new(FileSource::open(&path).unwrap()),
+                name,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            let vi = input.best_stream(ff::AVMEDIA_TYPE_VIDEO).unwrap();
+            let dec = Decoder::open(&input, vi, HwDecode::Stills).unwrap();
+            (input, dec, vi)
+        }
+        fn times(input: &mut Input, dec: &mut Decoder, vi: usize) -> Vec<f64> {
+            let (mut pkt, mut frame) = (Packet::new(), Frame::new());
+            let (mut out, mut eof) = (Vec::new(), false);
+            loop {
+                if !eof {
+                    if input.read(pkt.as_ptr()).unwrap() {
+                        if pkt.stream_index() != vi {
+                            pkt.unref();
+                            continue;
+                        }
+                        dec.send(pkt.as_ptr()).unwrap();
+                        pkt.unref();
+                    } else {
+                        eof = true;
+                        dec.send(std::ptr::null()).unwrap();
+                    }
+                }
+                while let Some(more) = dec.receive(&mut frame).unwrap() {
+                    if !more {
+                        return out;
+                    }
+                    out.push(dec.frame_time(&frame).unwrap());
+                    // SAFETY: our reference.
+                    unsafe { ff::av_frame_unref(frame.as_ptr()) };
+                }
+            }
+        }
+        let (mut input, mut dec, vi) = open();
+        let all = times(&mut input, &mut dec, vi);
+        assert!(!all.is_empty());
+
+        let (mut input, mut dec, vi) = open();
+        dec.no_end_of_stream = true;
+        assert_eq!(times(&mut input, &mut dec, vi), all);
+        assert!(dec.ending);
+        input.seek(0.0).unwrap();
+        dec.flush();
+        assert!(!dec.ending);
+        assert_eq!(times(&mut input, &mut dec, vi), all);
     }
 
     struct Decoded {
@@ -1280,9 +1390,9 @@ mod tests {
         // tests open decoders at the same time, so allow them to finish).
         let (name, _) = decode_all("h264_aac_180_LR.mp4", 5);
         assert_eq!(name, "h264");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while hardware_sessions() != 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hardware_sessions() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(hardware_sessions(), 0);
     }
