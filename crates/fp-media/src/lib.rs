@@ -33,6 +33,7 @@ pub mod thumb;
 #[cfg(test)]
 pub(crate) mod ts_fixture;
 pub(crate) mod v4l2;
+pub(crate) mod vp9;
 
 pub use decode::{HwDecode, hardware_sessions, hevc_10bit_hardware, set_hevc_10bit_hardware};
 pub use frame::{ColorInfo, PixelLayout, Q10cPicture, VideoFrame};
