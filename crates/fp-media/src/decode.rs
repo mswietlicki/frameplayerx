@@ -309,6 +309,9 @@ pub struct Decoder {
     /// Reads H.264 and HEVC packets' NAL units.
     nal: Option<NalReader>,
     skip: Option<Skip>,
+    /// Set by a flush of FFmpeg's V4L2 wrapper until a picture of a packet
+    /// sent since comes out; `receive` drops the ones before.
+    after_flush: Option<AfterFlush>,
     /// 3D Blu-ray video (MVC), decoded by the H.264 decoder it holds.
     mvc: Option<Box<crate::mvc::MvcDecoder>>,
     /// Packets precise seeks left out.
@@ -342,6 +345,37 @@ impl Skip {
             self.frame_duration
         };
         pts + duration * 0.5 < self.target
+    }
+}
+
+/// Pictures FFmpeg's V4L2 wrapper still hands back after a flush, decoded
+/// from packets sent before it: the wrapper has no flush of its own, so the
+/// driver decodes what it was given. They come out first, told apart by the
+/// pts of the packets sent since, which they don't have.
+#[derive(Debug, Default)]
+struct AfterFlush {
+    sent: Vec<i64>,
+}
+
+/// Packets sent after a flush remembered at most: a picture of one comes
+/// out long before, once the driver's queue has gone through.
+const AFTER_FLUSH_KEPT: usize = 64;
+
+impl AfterFlush {
+    /// Notes a packet sent. False when pictures can't be told apart: a
+    /// packet without a pts, or too many without a picture of one.
+    fn sent(&mut self, pts: i64) -> bool {
+        if pts == ff::AV_NOPTS_VALUE || self.sent.len() >= AFTER_FLUSH_KEPT {
+            return false;
+        }
+        self.sent.push(pts);
+        true
+    }
+
+    /// Whether the picture at `pts` comes from a packet sent before the
+    /// flush.
+    fn stale(&self, pts: i64) -> bool {
+        !self.sent.contains(&pts)
     }
 }
 
@@ -426,6 +460,7 @@ impl Decoder {
             origin: 0.0,
             nal: None,
             skip: None,
+            after_flush: None,
             mvc: Some(Box::new(mvc)),
             left_out: 0,
         };
@@ -544,6 +579,7 @@ impl Decoder {
             origin: 0.0,
             nal: None,
             skip: None,
+            after_flush: None,
             mvc: None,
             left_out: 0,
         })
@@ -586,6 +622,7 @@ impl Decoder {
                 origin: 0.0,
                 nal: None,
                 skip: None,
+                after_flush: None,
                 mvc: None,
                 left_out: 0,
             };
@@ -752,6 +789,13 @@ impl Decoder {
             return Ok(true);
         }
         check(r, "send packet")?;
+        if let Some(a) = self.after_flush.as_mut()
+            && !pkt.is_null()
+            // SAFETY: a valid packet.
+            && !a.sent(unsafe { (*pkt).pts })
+        {
+            self.after_flush = None;
+        }
         Ok(true)
     }
 
@@ -805,6 +849,15 @@ impl Decoder {
                 return Ok(Some(false));
             }
             check(r, "receive frame")?;
+            if let Some(a) = &self.after_flush {
+                // SAFETY: a decoded frame.
+                if a.stale(unsafe { (*frame.0).pts }) {
+                    // SAFETY: our reference to a frame left out.
+                    unsafe { ff::av_frame_unref(frame.0) };
+                    continue;
+                }
+                self.after_flush = None;
+            }
             if let Some(s) = self.skip {
                 // SAFETY: a decoded frame, our reference to it dropped when
                 // it is left out.
@@ -895,6 +948,9 @@ impl Decoder {
             // SAFETY: ctx is open.
             unsafe { ff::avcodec_flush_buffers(self.ctx) };
         }
+        // FFmpeg's decoders on this path that count as hardware are its
+        // V4L2 wrapper.
+        self.after_flush = self.hardware.then(AfterFlush::default);
     }
 
     /// Best-effort presentation time of a decoded frame in seconds on the
@@ -1282,5 +1338,21 @@ mod tests {
         assert_eq!(frames.len(), 24);
         let (_, v) = decode_all("vp9.webm", 5);
         assert_eq!(v[0].width, 320);
+    }
+
+    #[test]
+    fn pictures_of_packets_sent_before_a_flush_are_stale() {
+        let mut a = AfterFlush::default();
+        // Nothing sent since: whatever comes out is from before.
+        assert!(a.stale(9000));
+        assert!(a.sent(0) && a.sent(42));
+        assert!(a.stale(9000));
+        // In any order, as with reordered pictures.
+        assert!(!a.stale(42) && !a.stale(0));
+        // A packet without a pts, or too many: no telling them apart.
+        assert!(!AfterFlush::default().sent(ff::AV_NOPTS_VALUE));
+        let mut full = AfterFlush::default();
+        assert!((0..AFTER_FLUSH_KEPT as i64).all(|pts| full.sent(pts)));
+        assert!(!full.sent(AFTER_FLUSH_KEPT as i64));
     }
 }
