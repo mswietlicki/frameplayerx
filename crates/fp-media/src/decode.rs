@@ -2,6 +2,7 @@
 
 use crate::input::Input;
 use crate::nal::NalReader;
+use crate::vp9::HiddenFrames;
 use crate::{Error, Result, check};
 use fp_ffmpeg_sys as ff;
 use std::ffi::{CStr, CString};
@@ -323,6 +324,9 @@ pub struct Decoder {
     pub(crate) origin: f64,
     /// Reads H.264 and HEVC packets' NAL units.
     nal: Option<NalReader>,
+    /// VP9 frames that are never shown, which the hardware decoder hands
+    /// back as pictures anyway; `receive` leaves them out.
+    hidden: Option<HiddenFrames>,
     skip: Option<Skip>,
     /// 3D video decoded by the decoder this holds, its eyes paired.
     paired: Option<Paired>,
@@ -446,6 +450,7 @@ impl Decoder {
             time_base: inner.time_base,
             origin: inner.origin,
             nal: None,
+            hidden: None,
             skip: None,
             paired: Some(Paired::FrameSequential(Box::new(
                 crate::frame_seq::FrameSeqDecoder::new(inner, stream, stills),
@@ -498,6 +503,7 @@ impl Decoder {
             time_base,
             origin: 0.0,
             nal: None,
+            hidden: None,
             skip: None,
             paired: Some(Paired::Mvc(Box::new(mvc))),
             left_out: 0,
@@ -618,6 +624,7 @@ impl Decoder {
             time_base,
             origin: 0.0,
             nal: None,
+            hidden: None,
             skip: None,
             paired: None,
             left_out: 0,
@@ -663,6 +670,8 @@ impl Decoder {
                 time_base,
                 origin: 0.0,
                 nal: None,
+                hidden: (hardware && (*par).codec_id == ff::AV_CODEC_ID_VP9)
+                    .then(HiddenFrames::default),
                 skip: None,
                 paired: None,
                 left_out: 0,
@@ -840,6 +849,20 @@ impl Decoder {
             return Ok(true);
         }
         check(r, "send packet")?;
+        if let Some(h) = self.hidden.as_mut()
+            && !pkt.is_null()
+        {
+            // SAFETY: a valid packet holding `size` bytes at `data`.
+            unsafe {
+                let p = &*pkt;
+                if !p.data.is_null() {
+                    h.sent(
+                        p.pts,
+                        std::slice::from_raw_parts(p.data, p.size.max(0) as usize),
+                    );
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -911,6 +934,24 @@ impl Decoder {
             }
             check(r, "receive frame")?;
             waiting_since = Instant::now();
+            if let Some(h) = self.hidden.as_mut() {
+                // SAFETY: a decoded frame.
+                match h.drops(unsafe { (*frame.0).pts }) {
+                    Some(true) => {
+                        // SAFETY: our reference to a frame left out.
+                        unsafe { ff::av_frame_unref(frame.0) };
+                        continue;
+                    }
+                    Some(false) => {}
+                    None => {
+                        log::warn!(
+                            "{}: hidden VP9 frames aren't handed back after all",
+                            self.name
+                        );
+                        self.hidden = None;
+                    }
+                }
+            }
             if let Some(s) = self.skip {
                 // SAFETY: a decoded frame, our reference to it dropped when
                 // it is left out.
@@ -1009,6 +1050,9 @@ impl Decoder {
         self.replay_end = false;
         self.ending = false;
         self.first_picture = true;
+        if let Some(h) = self.hidden.as_mut() {
+            h.clear();
+        }
         if !self.ctx.is_null() {
             // SAFETY: ctx is open.
             unsafe { ff::avcodec_flush_buffers(self.ctx) };
