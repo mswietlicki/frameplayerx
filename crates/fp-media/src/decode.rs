@@ -126,12 +126,14 @@ pub enum HwDecode {
     Stills,
 }
 
-/// FFmpeg's V4L2 decoder for a codec. The Frame's decoder also takes VP9, but
-/// its VP9 sessions can bring the firmware down (ValveSoftware/SteamOS#2865).
+/// FFmpeg's V4L2 decoder for a codec. VP9 sessions can bring the Frame's
+/// firmware down (ValveSoftware/SteamOS#2865), which is why upstream plays VP9
+/// in software; this build keeps it in hardware.
 fn v4l2_name(codec: ff::AVCodecID) -> Option<&'static CStr> {
     match codec {
         ff::AV_CODEC_ID_HEVC => Some(c"hevc_v4l2m2m"),
         ff::AV_CODEC_ID_H264 => Some(c"h264_v4l2m2m"),
+        ff::AV_CODEC_ID_VP9 => Some(c"vp9_v4l2m2m"),
         _ => None,
     }
 }
@@ -1192,12 +1194,13 @@ mod tests {
             candidates(true, hevc, yuv420, HwDecode::Off, true, false),
             vec![Default]
         );
-        // Only HEVC and H.264 have a hardware path.
-        for codec in [
-            ff::AV_CODEC_ID_VP9,
-            ff::AV_CODEC_ID_VP8,
-            ff::AV_CODEC_ID_MPEG4,
-        ] {
+        // Codecs the native decoder does not handle go to FFmpeg directly.
+        assert_eq!(
+            candidates(true, ff::AV_CODEC_ID_VP9, yuv420, auto, true, false),
+            vec![Named(c"vp9_v4l2m2m", true), Default]
+        );
+        // The Frame's decoder takes no others.
+        for codec in [ff::AV_CODEC_ID_VP8, ff::AV_CODEC_ID_MPEG4] {
             assert_eq!(
                 candidates(true, codec, yuv420, auto, true, false),
                 vec![Default]
